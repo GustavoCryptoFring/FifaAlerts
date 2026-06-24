@@ -49,18 +49,21 @@ MOVE_THRESHOLD       = float(os.getenv("MOVE_THRESHOLD", "0.03"))   # 0.03 = 3 �
 MOVE_WINDOW_SEC      = int(os.getenv("MOVE_WINDOW_SEC", "900"))     # 15 минут
 MOVE_COOLDOWN_SEC    = int(os.getenv("MOVE_COOLDOWN_SEC", "300"))   # не повторять тот же алерт чаще, чем раз в 5 мин
 
-SMART_MONEY_USD        = float(os.getenv("SMART_MONEY_USD", "10000"))   # $10k
+SMART_MONEY_USD        = float(os.getenv("SMART_MONEY_USD", "10000"))   # $10k (любой кошелёк, п.2)
 SMART_MONEY_WINDOW_SEC = int(os.getenv("SMART_MONEY_WINDOW_SEC", "300"))# суммировать за 5 минут
 
-WHALE_USD = float(os.getenv("WHALE_USD", "100000"))   # $100k в одной позиции
+WHALE_USD = float(os.getenv("WHALE_USD", "100000"))   # $100k в одной позиции (п.4)
 
-TOP_HOLDERS_N          = int(os.getenv("TOP_HOLDERS_N", "10"))      # топ-N держателей на исход
-HOLDER_MIN_DELTA_SHARES= float(os.getenv("HOLDER_MIN_DELTA_SHARES", "1"))  # игнорировать дребезг < N shares
+TOP_HOLDERS_N = int(os.getenv("TOP_HOLDERS_N", "10"))  # топ-N держателей на исход (watchlist)
+
+# Пункт 5: сделки аккаунтов из топ-10 (watchlist) по ML/spread/total
+WATCH_TRADE_USD        = float(os.getenv("WATCH_TRADE_USD", "5000"))    # $5k
+WATCH_TRADE_WINDOW_SEC = int(os.getenv("WATCH_TRADE_WINDOW_SEC", "600"))# за 10 минут
 
 # --- Poll intervals (интервалы опроса) ---
-PRICE_POLL_SEC   = int(os.getenv("PRICE_POLL_SEC", "15"))    # цены/сделки
-HOLDERS_POLL_SEC = int(os.getenv("HOLDERS_POLL_SEC", "180")) # держатели/киты
-GAMES_REFRESH_SEC= int(os.getenv("GAMES_REFRESH_SEC", "600"))# обновление списка сегодняшних игр
+TICK_SEC         = int(os.getenv("TICK_SEC", "60"))         # общий тик бота — 1 минута
+HOLDERS_POLL_SEC = int(os.getenv("HOLDERS_POLL_SEC", "180"))# обновление watchlist держателей/китов
+GAMES_REFRESH_SEC= int(os.getenv("GAMES_REFRESH_SEC", "600"))# обновление списка игр
 
 # --- Game discovery (поиск игр) ---
 # Если автопоиск тега не сработает на твоём VPS — задай WORLD_CUP_TAG_ID
@@ -135,6 +138,11 @@ def pm_game_url(event_slug):
     return f"{base}{sep}via={REF_CODE}"
 
 
+def pm_profile_url(wallet):
+    """Build a Polymarket profile URL (by proxy wallet) with the referral param."""
+    return f"https://polymarket.com/profile/{wallet}?via={REF_CODE}"
+
+
 # =========================== Telegram ===========================
 def tg_send(text):
     """Send an HTML message to the configured chat. Best effort."""
@@ -167,25 +175,52 @@ def esc(s):
 
 
 # =========================== Polymarket API ===========================
+PROP_KEYWORDS = (
+    "corner", "card", "booking", "yellow", "red card", "foul", "offside",
+    "shot", "save", "possession", "goalscorer", "scorer", "assist",
+    "clean sheet", "penalty", "header", "throw-in", "free kick", "substitut",
+)
+
+
 def classify_market(m):
-    """Return 'moneyline' | 'spread' | 'total' | 'other' using several heuristics."""
+    """Return 'moneyline' | 'spread' | 'total' | 'other' using several heuristics.
+    Props (corners, cards, etc.) are explicitly excluded -> 'other'."""
+    text = (str(m.get("slug", "")) + " " + str(m.get("question", "")) + " " +
+            str(m.get("groupItemTitle", ""))).lower()
+    # Never treat a prop market as moneyline/spread/total
+    if any(k in text for k in PROP_KEYWORDS):
+        return "other"
     for key in ("sportsMarketType", "marketType", "type"):
         v = str(m.get(key, "")).lower()
         if v in ("moneyline", "spreads", "spread", "totals", "total"):
             return {"spreads": "spread", "totals": "total"}.get(v, v)
-    text = (str(m.get("slug", "")) + " " + str(m.get("question", "")) + " " +
-            str(m.get("groupItemTitle", ""))).lower()
     if "moneyline" in text:
         return "moneyline"
     if "spread" in text:
         return "spread"
     if "total" in text or "over/under" in text or "o/u" in text:
         return "total"
-    # Fallback: a 3-way market containing a "draw" outcome is the match winner.
+    # Outcome-based detection (e.g. "Over 2.5"/"Under 2.5", "CHE -1.5"/"CAN +1.5")
     outs = [str(o).lower() for o in parse_json_array(m.get("outcomes"))]
+    joined = " ".join(outs)
+    if any(o.startswith("over") or o.startswith("under") for o in outs):
+        return "total"
+    if re.search(r"[+\-]\d", joined):
+        return "spread"
     if any("draw" in o for o in outs):
         return "moneyline"
     return "other"
+
+
+def market_volume(m):
+    for key in ("volume", "volumeNum", "volume24hr", "volumeClob"):
+        try:
+            v = float(m.get(key))
+            if v:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def build_token_meta(event):
@@ -193,15 +228,17 @@ def build_token_meta(event):
     From one game event build:
       - game label and slug
       - per-token metadata (outcome name, market type, conditionId)
-      - list of moneyline token ids (for price-move detection)
-      - list of condition ids (for trades & holders)
+      - moneyline token ids (for price-move detection)
+      - condition_ids: all markets (for the smart-money scan, requirement 2)
+      - holder_market_conds: moneyline + the single highest-volume spread + total line
+        (these 7-ish outcomes are what we track for top-holder watchlist & whales)
     """
     slug = event.get("slug", "")
     label = event.get("title") or slug
-    token_meta = {}         # tokenId -> {outcome, mtype, conditionId, slug, label}
-    moneyline_tokens = []   # [tokenId, ...]
-    condition_ids = []      # [conditionId, ...]
-    token_to_condition = {} # tokenId -> conditionId
+    token_meta = {}
+    moneyline_tokens = []
+    condition_ids = []
+    by_type = {"moneyline": [], "spread": [], "total": []}
 
     for m in event.get("markets", []) or []:
         if m.get("closed") is True:
@@ -225,9 +262,17 @@ def build_token_meta(event):
                 "slug": slug,
                 "label": label,
             }
-            token_to_condition[tok] = cond
             if mtype == "moneyline":
                 moneyline_tokens.append(tok)
+        if mtype in by_type:
+            by_type[mtype].append({"cond": cond, "vol": market_volume(m)})
+
+    # holder markets: all moneyline + the single most-traded spread + total line
+    holder_market_conds = [x["cond"] for x in by_type["moneyline"]]
+    for t in ("spread", "total"):
+        if by_type[t]:
+            best = max(by_type[t], key=lambda x: x["vol"])
+            holder_market_conds.append(best["cond"])
 
     return {
         "slug": slug,
@@ -235,6 +280,7 @@ def build_token_meta(event):
         "token_meta": token_meta,
         "moneyline_tokens": moneyline_tokens,
         "condition_ids": list(dict.fromkeys(condition_ids)),
+        "holder_market_conds": list(dict.fromkeys(holder_market_conds)),
     }
 
 
@@ -541,9 +587,15 @@ class State:
         self.trade_watermark = {}                        # conditionId -> last ts seen
         self.sm_buffer = deque()                         # (ts, wallet, token, side, usd, meta)
         self.sm_alerted = {}                             # (wallet, token, side) -> ts_until
-        # holders
-        self.prev_amounts = defaultdict(dict)            # token -> {wallet: amount}
+        # holders / whales
         self.whales = set()                              # (token, wallet) currently >= WHALE_USD
+        # watchlist (top-10 holders of ML/spread/total) + their trades (requirement 5)
+        self.watchlist = set()                           # lowercased proxy wallets
+        self.wt_watermark = {}                           # conditionId -> last ts seen
+        self.wt_seen = deque(maxlen=20000)
+        self.wt_seen_set = set()
+        self.wt_buffer = deque()                         # (ts, wallet, token, side, usd, meta)
+        self.wt_alerted = {}                             # (wallet, token, side) -> ts_until
 
 STATE = State()
 
@@ -662,16 +714,17 @@ def detect_smart_money(games):
         tg_send(msg)
 
 
-def detect_holders(games):
+def refresh_holders_and_whales(games):
+    """Rebuild the top-10 watchlist over ML/spread/total markets and emit whale alerts (req 4)."""
     now = time.time()
     price_cache = {}
+    new_watch = set()
     for g in games:
-        for cond in g["condition_ids"]:
+        for cond in g["holder_market_conds"]:
             blocks = get_holders(cond, limit=200)
             for block in blocks:
                 token = block.get("token")
                 holders = block.get("holders") or []
-                # normalize amounts
                 rows = []
                 for h in holders:
                     amt = h.get("amount", h.get("shares"))
@@ -679,10 +732,16 @@ def detect_holders(games):
                         amt = float(amt)
                     except Exception:
                         continue
-                    rows.append((h.get("proxyWallet") or h.get("wallet") or "", amt, h))
+                    wallet = (h.get("proxyWallet") or h.get("wallet") or "")
+                    rows.append((wallet, amt, h))
                 if not rows:
                     continue
                 rows.sort(key=lambda x: x[1], reverse=True)
+
+                # watchlist: top-10 holders of this outcome token
+                for wallet, _amt, _h in rows[:TOP_HOLDERS_N]:
+                    if wallet:
+                        new_watch.add(wallet.lower())
 
                 meta = g["token_meta"].get(str(token), {}) if token else {}
                 outcome = meta.get("outcome", "?")
@@ -710,43 +769,90 @@ def detect_holders(games):
                         else:
                             STATE.whales.discard(key)
 
-                # ---- (3) top-10 holder buy/sell deltas ----
-                prev = STATE.prev_amounts[str(token)]
-                cur_top = rows[:TOP_HOLDERS_N]
-                cur_top_wallets = {w for w, _, _ in cur_top}
-                cur_amount = {w: a for w, a, _ in rows}
-                name_by_wallet = {w: holder_name(h) for w, _, h in rows}
+    STATE.watchlist = new_watch
+    log.info("watchlist size: %d wallets", len(new_watch))
 
-                # union of current top-10 and previous top-10 to catch sell-offs
-                watch = set(cur_top_wallets) | set(prev.keys())
-                changes = []
-                for w in watch:
-                    new_a = cur_amount.get(w, 0.0)
-                    old_a = prev.get(w, None)
-                    if old_a is None:
-                        # brand new entrant into top holders
-                        if w in cur_top_wallets and new_a >= HOLDER_MIN_DELTA_SHARES:
-                            changes.append((name_by_wallet.get(w, w[:6] + "..."), "bought", new_a, new_a))
-                        continue
-                    delta = new_a - old_a
-                    if abs(delta) < HOLDER_MIN_DELTA_SHARES:
-                        continue
-                    if w not in cur_top_wallets and w not in prev:
-                        continue
-                    verb = "bought" if delta > 0 else "sold"
-                    nm = name_by_wallet.get(w, w[:6] + "...")
-                    changes.append((nm, verb, abs(delta), new_a))
 
-                if changes:
-                    lines = [f"📊 <b>Top holders moved</b> — <b>{esc(outcome)}</b>",
-                             f"{esc(label)}"]
-                    for nm, verb, qty, holding in changes[:TOP_HOLDERS_N]:
-                        lines.append(f"• {esc(nm)} {verb} {qty:,.0f} (now {holding:,.0f})")
-                    lines.append(f'<a href="{link}">Open game</a>')
-                    tg_send("\n".join(lines))
+BET_TYPE_LABEL = {"moneyline": "Moneyline", "spread": "Spread", "total": "Total"}
 
-                # store snapshot (keep only wallets we actually saw)
-                STATE.prev_amounts[str(token)] = dict(cur_amount)
+
+def detect_watched_trades(games):
+    """(req 5) Alert when a watchlist account trades >= WATCH_TRADE_USD on one outcome in
+    the last WATCH_TRADE_WINDOW_SEC, on ML/spread/total markets. Shows the full summed amount."""
+    now = time.time()
+    if not STATE.watchlist:
+        return
+
+    for g in games:
+        for cond in g["holder_market_conds"]:
+            trades = get_trades(cond, limit=200)
+            wm = STATE.wt_watermark.get(cond, 0)
+            newest = wm
+            for t in trades:
+                wallet = (t.get("proxyWallet") or "")
+                if wallet.lower() not in STATE.watchlist:
+                    continue
+                ts = int(t.get("timestamp", 0) or 0)
+                if ts < wm - WATCH_TRADE_WINDOW_SEC:
+                    continue
+                asset = str(t.get("asset", ""))
+                size = float(t.get("size", 0) or 0)
+                side = str(t.get("side", "")).upper()
+                txh = t.get("transactionHash", "")
+                fp = f"{txh}|{wallet}|{asset}|{side}|{size}"
+                if fp in STATE.wt_seen_set:
+                    continue
+                STATE.wt_seen_set.add(fp)
+                STATE.wt_seen.append(fp)
+                if len(STATE.wt_seen) == STATE.wt_seen.maxlen:
+                    STATE.wt_seen_set.discard(STATE.wt_seen.popleft())
+                if ts <= wm:
+                    continue
+                newest = max(newest, ts)
+                usd = t.get("usdcSize")
+                price = float(t.get("price", 0) or 0)
+                usd = float(usd) if usd is not None else size * price
+                tmeta = g["token_meta"].get(asset, {})
+                STATE.wt_buffer.append((ts, wallet, asset, side, usd, {
+                    "name": t.get("name") or t.get("pseudonym") or (wallet[:6] + "..." + wallet[-4:]),
+                    "wallet": wallet,
+                    "outcome": t.get("outcome") or tmeta.get("outcome", "?"),
+                    "mtype": tmeta.get("mtype", "other"),
+                    "label": tmeta.get("label", g["label"]),
+                    "slug": g["slug"],
+                }))
+            STATE.wt_watermark[cond] = newest
+
+    # purge old buffer + expired locks
+    while STATE.wt_buffer and now - STATE.wt_buffer[0][0] > WATCH_TRADE_WINDOW_SEC:
+        STATE.wt_buffer.popleft()
+    for k in [k for k, exp in STATE.wt_alerted.items() if exp < now]:
+        STATE.wt_alerted.pop(k, None)
+
+    # aggregate by (wallet, asset, side) -> full summed USD
+    agg = defaultdict(lambda: [0.0, None])
+    for ts, wallet, asset, side, usd, meta in STATE.wt_buffer:
+        key = (wallet, asset, side)
+        agg[key][0] += usd
+        agg[key][1] = meta
+    for (wallet, asset, side), (total, meta) in agg.items():
+        if total < WATCH_TRADE_USD:
+            continue
+        if STATE.wt_alerted.get((wallet, asset, side), 0) > now:
+            continue
+        STATE.wt_alerted[(wallet, asset, side)] = now + WATCH_TRADE_WINDOW_SEC
+        icon = "🟢" if side == "BUY" else "🔴"
+        verb = "bought" if side == "BUY" else "sold"
+        btype = BET_TYPE_LABEL.get(meta["mtype"], meta["mtype"].title())
+        name_link = f'<a href="{pm_profile_url(meta["wallet"])}">{esc(meta["name"])}</a>'
+        msg = (
+            f"{icon} <b>Top-holder {side}</b>\n"
+            f"{name_link} {verb} ≈ <b>${total:,.0f}</b>\n"
+            f"{btype}: {esc(meta['outcome'])}\n"
+            f"{esc(meta['label'])}\n"
+            f'<a href="{pm_game_url(meta["slug"])}">Open game</a>'
+        )
+        tg_send(msg)
 
 
 # =========================== Main loop ===========================
@@ -798,11 +904,18 @@ def run_diag():
             print(f"  {slug}  game_date={gd}  closed={ev.get('closed')}{mark}")
         print("\nmatches in window:", len(in_window))
         for ev in in_window[:6]:
-            print(f"\n  -- markets of {ev.get('slug')} --")
-            for m in (ev.get("markets") or [])[:8]:
-                print(f"     [{classify_market(m)}] cond={m.get('conditionId')} "
-                      f"outcomes={parse_json_array(m.get('outcomes'))} "
-                      f"tokens={'yes' if m.get('clobTokenIds') else 'NO'}")
+            print(f"\n  -- {ev.get('slug')} --")
+            for m in (ev.get("markets") or [])[:30]:
+                print(f"     [{classify_market(m)}] vol={market_volume(m):.0f} "
+                      f"cond={m.get('conditionId')} outcomes={parse_json_array(m.get('outcomes'))}")
+            g = build_token_meta(ev)
+            print("     -> holder markets (ML + main spread + main total):",
+                  g["holder_market_conds"])
+            mt = {}
+            for tok, meta in g["token_meta"].items():
+                if meta["conditionId"] in g["holder_market_conds"]:
+                    mt.setdefault(meta["mtype"], []).append(meta["outcome"])
+            print("     -> tracked outcomes by type:", dict(mt))
         print("\nTip: to also watch upcoming days, set DAYS_AHEAD=3 in /etc/wc-bot.env")
         if in_window:
             print("Force-run line if needed:")
@@ -837,18 +950,27 @@ def main():
                 games = get_today_games()
                 last_games_refresh = now
                 if games:
-                    log.info("Tracking %d game(s) today:", len(games))
+                    log.info("Tracking %d game(s):", len(games))
                     for g in games:
-                        log.info("  - %s | markets=%d moneyline_tokens=%d slug=%s",
+                        log.info("  - %s | all_markets=%d holder_markets=%d moneyline_tokens=%d slug=%s",
                                  g["label"], len(g["condition_ids"]),
+                                 len(g["holder_market_conds"]),
                                  len(g["moneyline_tokens"]), g["slug"])
                 else:
-                    log.info("No World Cup games found for today (UTC). Will retry.")
+                    log.info("No World Cup games found in date window (UTC). Will retry.")
             except Exception as e:
                 log.exception("game refresh failed: %s", e)
 
         if games:
-            # fast loop: prices + smart money
+            # refresh watchlist + whales first (so watched-trades has a list to work with)
+            if now - last_holders >= HOLDERS_POLL_SEC or not STATE.watchlist:
+                try:
+                    refresh_holders_and_whales(games)
+                except Exception as e:
+                    log.exception("holders/whales refresh failed: %s", e)
+                last_holders = now
+
+            # every tick (1 min): odds moves, smart money (anyone), watched-holder trades
             try:
                 detect_price_moves(games)
             except Exception as e:
@@ -857,16 +979,12 @@ def main():
                 detect_smart_money(games)
             except Exception as e:
                 log.exception("smart money detector failed: %s", e)
+            try:
+                detect_watched_trades(games)
+            except Exception as e:
+                log.exception("watched-trades detector failed: %s", e)
 
-            # slower loop: holders + whales
-            if now - last_holders >= HOLDERS_POLL_SEC:
-                try:
-                    detect_holders(games)
-                except Exception as e:
-                    log.exception("holders detector failed: %s", e)
-                last_holders = now
-
-        time.sleep(PRICE_POLL_SEC)
+        time.sleep(TICK_SEC)
 
 
 if __name__ == "__main__":
