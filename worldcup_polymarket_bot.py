@@ -24,13 +24,14 @@ World Cup 2026 Polymarket -> Telegram alert bot (single file).
 """
 
 import os
+import re
 import sys
 import json
 import time
 import html
 import logging
 from collections import deque, defaultdict
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 
 import requests
 
@@ -67,6 +68,13 @@ GAMES_REFRESH_SEC= int(os.getenv("GAMES_REFRESH_SEC", "600"))# обновлен�
 WORLD_CUP_TAG_ID = os.getenv("WORLD_CUP_TAG_ID", "")
 GAMES_SLUGS      = [s.strip() for s in os.getenv("GAMES_SLUGS", "").split(",") if s.strip()]
 EVENT_SLUG_PREFIX= os.getenv("EVENT_SLUG_PREFIX", "fifwc")  # слаг игр World Cup начинается с этого
+
+# Сколько дней вперёд от сегодняшней даты (UTC) отслеживать.
+# 0 = только сегодня (как в исходном задании). 3 = сегодня + 3 ближайших дня.
+DAYS_AHEAD = int(os.getenv("DAYS_AHEAD", "0"))
+
+# "Чистый" слаг основного матча: fifwc-<team>-<team>-YYYY-MM-DD (без суффиксов вроде -total-corners).
+GAME_SLUG_RE = re.compile(r"^" + re.escape(EVENT_SLUG_PREFIX) + r"-[a-z0-9]+-[a-z0-9]+-(\d{4})-(\d{2})-(\d{2})$")
 
 # --- API hosts ---
 GAMMA = "https://gamma-api.polymarket.com"
@@ -262,14 +270,42 @@ def looks_world_cup(t):
     return False
 
 
-def tag_has_world_cup_events(tag_id):
-    """A tag is the right one only if it actually contains fifwc- game events."""
-    evs = http_get(f"{GAMMA}/events", params={
-        "tag_id": tag_id, "closed": "false", "active": "true", "limit": 100})
-    if not isinstance(evs, list):
-        return False
-    return any(isinstance(e, dict) and str(e.get("slug", "")).startswith(EVENT_SLUG_PREFIX)
-               for e in evs)
+def game_date_from_slug(slug):
+    """Extract the match date (UTC) embedded in a main-game slug, or None."""
+    m = GAME_SLUG_RE.match(str(slug))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+
+def is_main_game_event(ev):
+    """True only for real match events (clean slug, not a -total-corners/-props sub-event)."""
+    return isinstance(ev, dict) and GAME_SLUG_RE.match(str(ev.get("slug", ""))) is not None
+
+
+def fetch_tag_events(tag_id, limit=400):
+    out, offset = [], 0
+    while offset <= limit:
+        batch = http_get(f"{GAMMA}/events", params={
+            "tag_id": tag_id, "closed": "false", "active": "true",
+            "limit": 100, "offset": offset})
+        if not isinstance(batch, list) or not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+        offset += 100
+    return out
+
+
+def count_main_games(tag_id):
+    """How many real match events live under this tag (used to pick the best tag)."""
+    evs = fetch_tag_events(tag_id)
+    mains = [e for e in evs if is_main_game_event(e)]
+    return len(mains), mains
 
 
 def candidate_tag_ids_from_sports():
@@ -300,42 +336,41 @@ def candidate_tag_ids_from_sports():
 
 
 def discover_tag_id():
-    """Find the World Cup tag id by scanning all tags and validating via events. Cached."""
+    """Pick the tag with the MOST real World Cup match events. Cached after success."""
     global _TAG_CACHE
     if WORLD_CUP_TAG_ID:
         return WORLD_CUP_TAG_ID
     if _TAG_CACHE != "UNSET":
         return _TAG_CACHE
-    result = None
+    best, best_n = None, 0
     try:
-        # Primary: tag ids straight from /sports (World Cup / soccer entries)
-        for tid in candidate_tag_ids_from_sports():
-            if tag_has_world_cup_events(tid):
-                log.info("World Cup tag resolved via /sports: %s", tid)
-                result = tid
-                break
-        # Fallback: scan all /tags by label/slug
-        if result is None:
-            candidates = [t for t in iter_tags() if looks_world_cup(t)]
-            candidates.sort(key=lambda t: (
-                0 if str(t.get("slug", "")).lower() == "world-cup" else
-                1 if ("world" in str(t.get("label", "")).lower() and "club" not in str(t.get("label", "")).lower()) else 2
-            ))
-            for t in candidates:
+        candidates = list(candidate_tag_ids_from_sports())
+        for tid in candidates:
+            n, _ = count_main_games(tid)
+            log.info("tag %s -> %d main game(s)", tid, n)
+            if n > best_n:
+                best, best_n = tid, n
+        # Fallback: if /sports tags held no real matches, scan all /tags
+        if best_n == 0:
+            log.info("No main games under /sports tags; scanning /tags as fallback")
+            for t in iter_tags():
+                if not looks_world_cup(t):
+                    continue
                 tid = str(t.get("id"))
-                if tag_has_world_cup_events(tid):
-                    log.info("World Cup tag resolved via /tags: id=%s slug=%s label=%s",
-                             tid, t.get("slug"), t.get("label"))
-                    result = tid
-                    break
+                n, _ = count_main_games(tid)
+                if n > best_n:
+                    best, best_n = tid, n
+                    if n >= 4:   # clearly the games tag; stop early
+                        break
     except Exception as e:
-        log.warning("tag discovery failed (%s); will fall back to slug scan", e)
-    if result is None:
-        log.warning("No validated World Cup tag found. Using slug scan; "
-                    "set WORLD_CUP_TAG_ID or GAMES_SLUGS to be safe.")
+        log.warning("tag discovery failed (%s)", e)
+    if best:
+        log.info("World Cup tag resolved: %s (%d main games)", best, best_n)
+        _TAG_CACHE = best
     else:
-        _TAG_CACHE = result   # cache only successful resolutions
-    return result
+        log.warning("No tag with real match events found. "
+                    "Set WORLD_CUP_TAG_ID or GAMES_SLUGS to be safe.")
+    return best
 
 
 def fetch_events_by_tag(tag_id):
@@ -401,8 +436,17 @@ def is_today_utc(event):
     return dt.date() == datetime.now(timezone.utc).date()
 
 
+def in_date_window(slug):
+    """True if the match date in the slug is within [today, today+DAYS_AHEAD] (UTC)."""
+    gdate = game_date_from_slug(slug)
+    if gdate is None:
+        return False
+    today = datetime.now(timezone.utc).date()
+    return today <= gdate <= (today + timedelta(days=DAYS_AHEAD))
+
+
 def get_today_games():
-    """Return list of game dicts (see build_token_meta) for today's World Cup matches."""
+    """Return real World Cup match events within the date window."""
     if GAMES_SLUGS:
         events = fetch_events_by_explicit_slugs(GAMES_SLUGS)
     else:
@@ -417,10 +461,13 @@ def get_today_games():
         slug = ev.get("slug", "")
         if slug in seen:
             continue
-        if not str(slug).startswith(EVENT_SLUG_PREFIX) and not GAMES_SLUGS:
-            continue
-        if not GAMES_SLUGS and not is_today_utc(ev):
-            continue
+        if not GAMES_SLUGS:
+            if not is_main_game_event(ev):     # skip props like -total-corners
+                continue
+            if ev.get("closed") is True:
+                continue
+            if not in_date_window(slug):       # date taken from the slug itself
+                continue
         seen.add(slug)
         g = build_token_meta(ev)
         if g["condition_ids"]:
@@ -722,53 +769,44 @@ def run_diag():
                 print("  sport=%s tags=%s series=%s" %
                       (sp.get("sport"), sp.get("tags"), sp.get("series")))
 
-    print("\n===== candidate tag ids from /sports =====")
+    print("\n===== candidate tag ids from /sports (with real match counts) =====")
     cands = candidate_tag_ids_from_sports()
     print("candidates:", cands)
     for tid in cands:
-        print("  tag %s -> has_fifwc_events=%s" % (tid, tag_has_world_cup_events(tid)))
-
-    print("\n===== searching ALL /tags for World Cup (fallback) =====")
-    matches = []
-    for t in iter_tags():
-        if looks_world_cup(t):
-            matches.append(t)
-    print("world-cup-like tags found:", len(matches))
-    for t in matches[:40]:
-        print("  id=%s slug=%s label=%s" % (t.get("id"), t.get("slug"), t.get("label")))
+        n, _ = count_main_games(tid)
+        print("  tag %s -> %d real match event(s)" % (tid, n))
 
     print("\n===== resolved tag via discover_tag_id() =====")
     tid = discover_tag_id()
     print("resolved tag id:", tid)
 
     if tid:
-        evs = http_get(f"{GAMMA}/events", params={
-            "tag_id": tid, "closed": "false", "active": "true", "limit": 100})
-        evs = evs if isinstance(evs, list) else []
-        print("events under tag:", len(evs))
-        todays = []
-        for ev in evs:
-            sd = ev.get("startDate") or ev.get("gameStartTime")
+        evs = fetch_tag_events(tid)
+        mains = [e for e in evs if is_main_game_event(e)]
+        print("events under tag: %d  (real matches: %d)" % (len(evs), len(mains)))
+        window_hi = today + timedelta(days=DAYS_AHEAD)
+        print("date window: %s .. %s  (DAYS_AHEAD=%d)" % (today, window_hi, DAYS_AHEAD))
+        mains.sort(key=lambda e: str(e.get("slug", "")))
+        in_window = []
+        for ev in mains:
+            slug = ev.get("slug", "")
+            gd = game_date_from_slug(slug)
             mark = ""
-            try:
-                d = datetime.fromisoformat(str(sd).replace("Z", "+00:00")).astimezone(timezone.utc).date()
-                if d == today:
-                    mark = "  <<< TODAY"
-                    todays.append(ev)
-            except Exception:
-                pass
-            if str(ev.get("slug", "")).startswith(EVENT_SLUG_PREFIX):
-                print(f"  slug={ev.get('slug')} start={sd} closed={ev.get('closed')}{mark}")
-        print("\nTODAY games count:", len(todays))
-        for ev in todays[:6]:
+            if gd is not None and today <= gd <= window_hi:
+                mark = "  <<< IN WINDOW"
+                in_window.append(ev)
+            print(f"  {slug}  game_date={gd}  closed={ev.get('closed')}{mark}")
+        print("\nmatches in window:", len(in_window))
+        for ev in in_window[:6]:
             print(f"\n  -- markets of {ev.get('slug')} --")
             for m in (ev.get("markets") or [])[:8]:
                 print(f"     [{classify_market(m)}] cond={m.get('conditionId')} "
                       f"outcomes={parse_json_array(m.get('outcomes'))} "
                       f"tokens={'yes' if m.get('clobTokenIds') else 'NO'}")
-        if todays:
-            print("\nForce-run line for /etc/wc-bot.env if needed:")
-            print("  GAMES_SLUGS=" + ",".join(e.get("slug", "") for e in todays))
+        print("\nTip: to also watch upcoming days, set DAYS_AHEAD=3 in /etc/wc-bot.env")
+        if in_window:
+            print("Force-run line if needed:")
+            print("  GAMES_SLUGS=" + ",".join(e.get("slug", "") for e in in_window))
     else:
         print("No tag resolved. Raw first /sports object for reference:")
         sports = http_get(f"{GAMMA}/sports")
