@@ -265,11 +265,38 @@ def looks_world_cup(t):
 def tag_has_world_cup_events(tag_id):
     """A tag is the right one only if it actually contains fifwc- game events."""
     evs = http_get(f"{GAMMA}/events", params={
-        "tag_id": tag_id, "closed": "false", "active": "true", "limit": 50})
+        "tag_id": tag_id, "closed": "false", "active": "true", "limit": 100})
     if not isinstance(evs, list):
         return False
     return any(isinstance(e, dict) and str(e.get("slug", "")).startswith(EVENT_SLUG_PREFIX)
                for e in evs)
+
+
+def candidate_tag_ids_from_sports():
+    """Read /sports (each entry has 'sport' slug + comma-separated 'tags' ids) and
+    return tag ids belonging to World Cup / soccer entries."""
+    out, seen = [], set()
+    sports = http_get(f"{GAMMA}/sports")
+    if not isinstance(sports, list):
+        return out
+    for sp in sports:
+        if not isinstance(sp, dict):
+            continue
+        slug = str(sp.get("sport", "")).lower()
+        if not any(k in slug for k in ("world", "fifa", "fifwc", "soccer", "football")):
+            continue
+        tags = sp.get("tags")
+        if isinstance(tags, str):
+            parts = [x.strip() for x in tags.split(",") if x.strip()]
+        elif isinstance(tags, list):
+            parts = [str(x).strip() for x in tags]
+        else:
+            parts = []
+        for p in parts:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+    return out
 
 
 def discover_tag_id():
@@ -281,19 +308,26 @@ def discover_tag_id():
         return _TAG_CACHE
     result = None
     try:
-        candidates = [t for t in iter_tags() if looks_world_cup(t)]
-        # prefer an exact 'world-cup' slug, then non-"club" world cup labels
-        candidates.sort(key=lambda t: (
-            0 if str(t.get("slug", "")).lower() == "world-cup" else
-            1 if ("world" in str(t.get("label", "")).lower() and "club" not in str(t.get("label", "")).lower()) else 2
-        ))
-        for t in candidates:
-            tid = str(t.get("id"))
+        # Primary: tag ids straight from /sports (World Cup / soccer entries)
+        for tid in candidate_tag_ids_from_sports():
             if tag_has_world_cup_events(tid):
-                log.info("World Cup tag resolved: id=%s slug=%s label=%s",
-                         tid, t.get("slug"), t.get("label"))
+                log.info("World Cup tag resolved via /sports: %s", tid)
                 result = tid
                 break
+        # Fallback: scan all /tags by label/slug
+        if result is None:
+            candidates = [t for t in iter_tags() if looks_world_cup(t)]
+            candidates.sort(key=lambda t: (
+                0 if str(t.get("slug", "")).lower() == "world-cup" else
+                1 if ("world" in str(t.get("label", "")).lower() and "club" not in str(t.get("label", "")).lower()) else 2
+            ))
+            for t in candidates:
+                tid = str(t.get("id"))
+                if tag_has_world_cup_events(tid):
+                    log.info("World Cup tag resolved via /tags: id=%s slug=%s label=%s",
+                             tid, t.get("slug"), t.get("label"))
+                    result = tid
+                    break
     except Exception as e:
         log.warning("tag discovery failed (%s); will fall back to slug scan", e)
     if result is None:
@@ -676,16 +710,32 @@ def run_diag():
     today = datetime.now(timezone.utc).date()
     print("today (UTC):", today)
 
-    print("\n===== searching ALL /tags for World Cup =====")
+    print("\n===== /sports entries matching world/fifa/soccer =====")
+    sports = http_get(f"{GAMMA}/sports")
+    if isinstance(sports, list):
+        print("total sports:", len(sports))
+        for sp in sports:
+            if not isinstance(sp, dict):
+                continue
+            slug = str(sp.get("sport", "")).lower()
+            if any(k in slug for k in ("world", "fifa", "fifwc", "soccer", "football")):
+                print("  sport=%s tags=%s series=%s" %
+                      (sp.get("sport"), sp.get("tags"), sp.get("series")))
+
+    print("\n===== candidate tag ids from /sports =====")
+    cands = candidate_tag_ids_from_sports()
+    print("candidates:", cands)
+    for tid in cands:
+        print("  tag %s -> has_fifwc_events=%s" % (tid, tag_has_world_cup_events(tid)))
+
+    print("\n===== searching ALL /tags for World Cup (fallback) =====")
     matches = []
     for t in iter_tags():
         if looks_world_cup(t):
             matches.append(t)
     print("world-cup-like tags found:", len(matches))
     for t in matches[:40]:
-        has = tag_has_world_cup_events(str(t.get("id")))
-        print("  id=%s slug=%s label=%s  has_fifwc_events=%s" %
-              (t.get("id"), t.get("slug"), t.get("label"), has))
+        print("  id=%s slug=%s label=%s" % (t.get("id"), t.get("slug"), t.get("label")))
 
     print("\n===== resolved tag via discover_tag_id() =====")
     tid = discover_tag_id()
