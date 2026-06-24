@@ -230,46 +230,78 @@ def build_token_meta(event):
     }
 
 
+_TAG_CACHE = "UNSET"  # cache the resolved World Cup tag id across refreshes
+
+
+def iter_tags(max_pages=30, page=1000):
+    """Yield tag dicts across all /tags pages (offset pagination)."""
+    offset = 0
+    for _ in range(max_pages):
+        batch = http_get(f"{GAMMA}/tags", params={"limit": page, "offset": offset})
+        if not isinstance(batch, list) or not batch:
+            return
+        for t in batch:
+            if isinstance(t, dict):
+                yield t
+        if len(batch) < page:
+            return
+        offset += page
+
+
+def looks_world_cup(t):
+    slug = str(t.get("slug", "")).lower()
+    label = str(t.get("label", t.get("name", ""))).lower()
+    if slug.startswith(EVENT_SLUG_PREFIX):
+        return True
+    if "world-cup" in slug:
+        return True
+    if "world" in label and "cup" in label:
+        return True
+    if "fifa" in slug or "fifa" in label:
+        return True
+    return False
+
+
+def tag_has_world_cup_events(tag_id):
+    """A tag is the right one only if it actually contains fifwc- game events."""
+    evs = http_get(f"{GAMMA}/events", params={
+        "tag_id": tag_id, "closed": "false", "active": "true", "limit": 50})
+    if not isinstance(evs, list):
+        return False
+    return any(isinstance(e, dict) and str(e.get("slug", "")).startswith(EVENT_SLUG_PREFIX)
+               for e in evs)
+
+
 def discover_tag_id():
-    """Try to find the World Cup tag id from /tags, then /sports. Returns str or None."""
+    """Find the World Cup tag id by scanning all tags and validating via events. Cached."""
+    global _TAG_CACHE
     if WORLD_CUP_TAG_ID:
         return WORLD_CUP_TAG_ID
-    # /tags  (response shape can vary; guard everything)
+    if _TAG_CACHE != "UNSET":
+        return _TAG_CACHE
+    result = None
     try:
-        tags = http_get(f"{GAMMA}/tags", params={"limit": 1000})
-        if isinstance(tags, list):
-            for t in tags:
-                if not isinstance(t, dict):
-                    continue
-                slug = str(t.get("slug", "")).lower()
-                label = str(t.get("label", t.get("name", ""))).lower()
-                if slug in ("world-cup", "fifa-world-cup") or "world cup" in label:
-                    tid = t.get("id")
-                    if tid:
-                        log.info("World Cup tag id from /tags: %s (%s)", tid, label or slug)
-                        return str(tid)
+        candidates = [t for t in iter_tags() if looks_world_cup(t)]
+        # prefer an exact 'world-cup' slug, then non-"club" world cup labels
+        candidates.sort(key=lambda t: (
+            0 if str(t.get("slug", "")).lower() == "world-cup" else
+            1 if ("world" in str(t.get("label", "")).lower() and "club" not in str(t.get("label", "")).lower()) else 2
+        ))
+        for t in candidates:
+            tid = str(t.get("id"))
+            if tag_has_world_cup_events(tid):
+                log.info("World Cup tag resolved: id=%s slug=%s label=%s",
+                         tid, t.get("slug"), t.get("label"))
+                result = tid
+                break
     except Exception as e:
-        log.warning("/tags discovery failed (%s); continuing", e)
-    # /sports
-    try:
-        sports = http_get(f"{GAMMA}/sports")
-        if isinstance(sports, list):
-            for sp in sports:
-                if not isinstance(sp, dict):
-                    continue
-                blob = json.dumps(sp).lower()
-                if "world cup" in blob or "fifa" in blob:
-                    for t in sp.get("tags", []) or []:
-                        if isinstance(t, dict) and t.get("id"):
-                            log.info("World Cup tag id from /sports: %s", t["id"])
-                            return str(t["id"])
-                    if sp.get("tagId"):
-                        return str(sp["tagId"])
-    except Exception as e:
-        log.warning("/sports discovery failed (%s); continuing", e)
-    log.warning("Could not auto-discover World Cup tag id. "
-                "Falling back to slug scan; set WORLD_CUP_TAG_ID or GAMES_SLUGS to be safe.")
-    return None
+        log.warning("tag discovery failed (%s); will fall back to slug scan", e)
+    if result is None:
+        log.warning("No validated World Cup tag found. Using slug scan; "
+                    "set WORLD_CUP_TAG_ID or GAMES_SLUGS to be safe.")
+    else:
+        _TAG_CACHE = result   # cache only successful resolutions
+    return result
 
 
 def fetch_events_by_tag(tag_id):
@@ -638,56 +670,62 @@ def detect_holders(games):
 
 # =========================== Main loop ===========================
 def run_diag():
-    """Print raw API shapes to help configure game discovery.
-    Run on the server:  ./venv/bin/python worldcup_polymarket_bot.py --diag
+    """Find the World Cup tag, list today's games and their markets.
+    Run:  ./venv/bin/python worldcup_polymarket_bot.py --diag
     """
-    print("\n===== /tags (first 5) =====")
-    tags = http_get(f"{GAMMA}/tags", params={"limit": 5})
-    print("type:", type(tags).__name__)
-    print((json.dumps(tags, indent=2)[:1200]) if tags is not None else "None")
-
-    print("\n===== /sports =====")
-    sports = http_get(f"{GAMMA}/sports")
-    if isinstance(sports, list):
-        print("count:", len(sports))
-        for sp in sports[:12]:
-            if isinstance(sp, dict):
-                print("  ", {k: sp.get(k) for k in ("id", "slug", "label", "title", "name")})
-    else:
-        print("type:", type(sports).__name__, str(sports)[:400])
-
-    print("\n===== scanning /events for slugs starting with '%s' =====" % EVENT_SLUG_PREFIX)
-    found, offset = [], 0
-    while offset <= 2000:
-        batch = http_get(f"{GAMMA}/events", params={
-            "closed": "false", "active": "true", "limit": 100, "offset": offset})
-        if not isinstance(batch, list) or not batch:
-            break
-        for ev in batch:
-            if isinstance(ev, dict) and str(ev.get("slug", "")).startswith(EVENT_SLUG_PREFIX):
-                found.append(ev)
-        if len(batch) < 100:
-            break
-        offset += 100
-    print("matching events found:", len(found))
-
     today = datetime.now(timezone.utc).date()
     print("today (UTC):", today)
-    for ev in found[:40]:
-        sd = ev.get("startDate") or ev.get("gameStartTime")
-        tag = ""
-        try:
-            d = datetime.fromisoformat(str(sd).replace("Z", "+00:00")).astimezone(timezone.utc).date()
-            tag = "   <<< TODAY" if d == today else ""
-        except Exception:
-            pass
-        print(f"  slug={ev.get('slug')}  start={sd}  closed={ev.get('closed')}{tag}")
-        for m in (ev.get("markets") or [])[:4]:
-            print(f"       [{classify_market(m)}] cond={m.get('conditionId')} "
-                  f"outcomes={parse_json_array(m.get('outcomes'))}")
-    print("\nIf TODAY games appear above, you can force-run by setting in /etc/wc-bot.env:")
-    print("  GAMES_SLUGS=slug1,slug2")
-    print("Paste this whole output to get discovery tuned.\n")
+
+    print("\n===== searching ALL /tags for World Cup =====")
+    matches = []
+    for t in iter_tags():
+        if looks_world_cup(t):
+            matches.append(t)
+    print("world-cup-like tags found:", len(matches))
+    for t in matches[:40]:
+        has = tag_has_world_cup_events(str(t.get("id")))
+        print("  id=%s slug=%s label=%s  has_fifwc_events=%s" %
+              (t.get("id"), t.get("slug"), t.get("label"), has))
+
+    print("\n===== resolved tag via discover_tag_id() =====")
+    tid = discover_tag_id()
+    print("resolved tag id:", tid)
+
+    if tid:
+        evs = http_get(f"{GAMMA}/events", params={
+            "tag_id": tid, "closed": "false", "active": "true", "limit": 100})
+        evs = evs if isinstance(evs, list) else []
+        print("events under tag:", len(evs))
+        todays = []
+        for ev in evs:
+            sd = ev.get("startDate") or ev.get("gameStartTime")
+            mark = ""
+            try:
+                d = datetime.fromisoformat(str(sd).replace("Z", "+00:00")).astimezone(timezone.utc).date()
+                if d == today:
+                    mark = "  <<< TODAY"
+                    todays.append(ev)
+            except Exception:
+                pass
+            if str(ev.get("slug", "")).startswith(EVENT_SLUG_PREFIX):
+                print(f"  slug={ev.get('slug')} start={sd} closed={ev.get('closed')}{mark}")
+        print("\nTODAY games count:", len(todays))
+        for ev in todays[:6]:
+            print(f"\n  -- markets of {ev.get('slug')} --")
+            for m in (ev.get("markets") or [])[:8]:
+                print(f"     [{classify_market(m)}] cond={m.get('conditionId')} "
+                      f"outcomes={parse_json_array(m.get('outcomes'))} "
+                      f"tokens={'yes' if m.get('clobTokenIds') else 'NO'}")
+        if todays:
+            print("\nForce-run line for /etc/wc-bot.env if needed:")
+            print("  GAMES_SLUGS=" + ",".join(e.get("slug", "") for e in todays))
+    else:
+        print("No tag resolved. Raw first /sports object for reference:")
+        sports = http_get(f"{GAMMA}/sports")
+        if isinstance(sports, list) and sports:
+            print(json.dumps(sports[0], indent=2)[:1500])
+
+    print("\nDONE. Paste this whole output back.")
 
 
 def main():
