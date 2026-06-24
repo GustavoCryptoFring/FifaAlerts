@@ -1,0 +1,14 @@
+[Unit]
+Description=World Cup Polymarket Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/wc-bot
+EnvironmentFile=/etc/wc-bot.env
+ExecStart=/opt/wc-bot/venv/bin/python /opt/wc-bot/worldcup_polymarket_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

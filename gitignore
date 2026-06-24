@@ -1,0 +1,10 @@
+# secrets — НИКОГДА не коммить
+*.env
+.env
+wc-bot.env
+
+# python
+__pycache__/
+*.pyc
+venv/
+.venv/

@@ -1,0 +1,20 @@
+# Авто-деплой: при каждом push в ветку main GitHub заходит по SSH на VPS и запускает deploy.sh.
+# В настройках репозитория (Settings -> Secrets and variables -> Actions) добавь секреты:
+#   VPS_HOST      — ip или домен сервера
+#   VPS_USER      — пользователь ssh (например root)
+#   VPS_SSH_KEY   — ПРИВАТНЫЙ ssh-ключ, чей публичный лежит в ~/.ssh/authorized_keys на сервере
+name: deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: /opt/wc-bot/deploy.sh
