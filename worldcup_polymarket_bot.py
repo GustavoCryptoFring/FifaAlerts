@@ -678,6 +678,7 @@ def detect_smart_money(games):
                     "outcome": t.get("outcome", "?"),
                     "label": t.get("title", g["label"]),
                     "slug": g["slug"],
+                    "wallet": wallet,
                     "name": t.get("name") or t.get("pseudonym") or (wallet[:6] + "..." + wallet[-4:] if wallet else "unknown"),
                 }))
             STATE.trade_watermark[cond] = newest
@@ -704,9 +705,11 @@ def detect_smart_money(games):
         verb = "is accumulating" if side == "BUY" else "is dumping"
         icon = "🟢" if side == "BUY" else "🔴"
         link = pm_game_url(meta["slug"])
+        name_link = (f'<a href="{pm_profile_url(meta["wallet"])}">{esc(meta["name"])}</a>'
+                     if meta.get("wallet") else f"<b>{esc(meta['name'])}</b>")
         msg = (
             f"{icon} <b>Smart money — {side}</b>\n"
-            f"<b>{esc(meta['name'])}</b> {verb} <b>{esc(meta['outcome'])}</b>\n"
+            f"{name_link} {verb} <b>{esc(meta['outcome'])}</b>\n"
             f"{esc(meta['label'])}\n"
             f"≈ ${total:,.0f} in ≤{SMART_MONEY_WINDOW_SEC//60}m\n"
             f'<a href="{link}">Open game</a>'
@@ -757,9 +760,12 @@ def refresh_holders_and_whales(games):
                         if value >= WHALE_USD:
                             if key not in STATE.whales:
                                 STATE.whales.add(key)
+                                name_link = (
+                                    f'<a href="{pm_profile_url(wallet)}">{esc(holder_name(h))}</a>'
+                                    if wallet else f"<b>{esc(holder_name(h))}</b>")
                                 msg = (
                                     f"🐋 <b>Whale position</b>\n"
-                                    f"<b>{esc(holder_name(h))}</b> holds "
+                                    f"{name_link} holds "
                                     f"{amt:,.0f} shares of <b>{esc(outcome)}</b>\n"
                                     f"{esc(label)} @ {price*100:.1f}% ≈ <b>${value:,.0f}</b>\n"
                                     f"Strong conviction on this outcome.\n"
